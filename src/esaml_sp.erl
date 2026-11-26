@@ -235,7 +235,10 @@ validate_assertion(Xml, SP = #esaml_sp{}) ->
 %% @doc Validate and decode an assertion envelope in parsed XML
 %%
 %% The dupe_fun argument is intended to detect duplicate assertions
-%% in the case of a replay attack.
+%% in the case of a replay attack. It receives the decoded assertion and the
+%% canonical digest of the assertion element, so the digest does not change when
+%% unsigned parts of the response around it change. Any result but `ok' refuses
+%% the assertion.
 -spec validate_assertion(xml(), dupe_fun(), esaml:sp()) ->
         {ok, esaml:assertion()} | {error, Reason :: term()}.
 validate_assertion(Xml, DuplicateFun, SP = #esaml_sp{}) ->
@@ -297,12 +300,12 @@ validate_assertion(Xml, DuplicateFun, SP = #esaml_sp{}) ->
         end,
         fun(A) ->
             case esaml:validate_assertion(A, SP#esaml_sp.consume_uri, get_entity_id(SP)) of
-                {ok, AR} -> AR;
+                {ok, AR} -> {AR, A};
                 {error, Reason} -> {error, Reason}
             end
         end,
-        fun(AR) ->
-            case DuplicateFun(AR, xmerl_dsig:digest(Xml)) of
+        fun({AR, A}) ->
+            case DuplicateFun(AR, xmerl_dsig:digest(A)) of
                 ok -> AR;
                 _ -> {error, duplicate}
             end
@@ -319,8 +322,8 @@ decrypt_assertion(Xml, #esaml_sp{key = PrivateKey}) ->
     SymmetricKey = decrypt_key_info(EncryptedData, PrivateKey),
     [#xmlAttribute{value = Algorithm}] = xmerl_xpath:string("./xenc:EncryptionMethod/@Algorithm", EncryptedData, [{namespace, XencNs}]),
     AssertionXml = block_decrypt(Algorithm, SymmetricKey, CipherValue),
-    {Assertion, _} = xmerl_scan:string(AssertionXml, [{namespace_conformant, true}]),
-    Assertion.
+    %% Anyone with the SP certificate can encrypt, so the plaintext is untrusted.
+    esaml_util:scan_untrusted_xml(list_to_binary(AssertionXml)).
 
 
 decrypt_key_info(EncryptedData, Key) ->

@@ -36,19 +36,27 @@ xml_payload_type(Xml) ->
     end.
 
 %% @doc Unpack and parse a SAMLResponse with given encoding
--spec decode_response(SAMLEncoding :: binary(), SAMLResponse :: binary()) -> #xmlDocument{}.
+%%
+%% The input is untrusted. A payload that is too large or not acceptable XML
+%% raises `error:{saml_payload_refused, Reason}'; see
+%% esaml_util:scan_untrusted_xml/1.
+-spec decode_response(SAMLEncoding :: binary(), SAMLResponse :: binary()) -> #xmlElement{}.
 decode_response(?deflate, SAMLResponse) ->
-	XmlData = binary_to_list(zlib:unzip(base64:decode(SAMLResponse))),
-	{Xml, _} = xmerl_scan:string(XmlData, [{namespace_conformant, true}]),
-    Xml;
+    XmlData = esaml_util:bounded_inflate(decode_base64(SAMLResponse)),
+    esaml_util:scan_untrusted_xml(XmlData);
 decode_response(_, SAMLResponse) ->
-	Data = base64:decode(SAMLResponse),
-    XmlData = case (catch zlib:unzip(Data)) of
-        {'EXIT', _} -> binary_to_list(Data);
-        Bin -> binary_to_list(Bin)
-    end,
-	{Xml, _} = xmerl_scan:string(XmlData, [{namespace_conformant, true}]),
-    Xml.
+    Data = decode_base64(SAMLResponse),
+    %% Only data that is not DEFLATE falls back to raw XML. A refusal for size
+    %% is not a data_error, so it propagates.
+    XmlData = try esaml_util:bounded_inflate(Data)
+              catch error:data_error -> Data
+              end,
+    esaml_util:scan_untrusted_xml(XmlData).
+
+%% Base64 of 512 KB, with room for MIME line breaks.
+decode_base64(Encoded) ->
+    iolist_size(Encoded) =< 1048576 orelse esaml_util:refuse_payload(payload_too_large),
+    base64:decode(iolist_to_binary(Encoded)).
 
 %% @doc Encode a SAMLRequest (or SAMLResponse) as an HTTP-Redirect binding
 %%

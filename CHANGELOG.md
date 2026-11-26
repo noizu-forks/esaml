@@ -2,6 +2,14 @@
 
 All changes are in the `main` branch (`master` remains unchanged).
 
+### v4.6.0 (noizu-forks) - 2026-11-26
++   CVE-2026-28809: untrusted XML with a DOCTYPE, an entity declaration or a processing instruction is refused; every parse of outside XML disables entities and external reads.
++   CVE-2026-93471: DEFLATE input and output are limited to 512 KB.
++   CVE-2026-105270: an untrusted payload may only use element names, attribute names, prefixes and namespace URIs that are already atoms. Add the names of your identity provider with `{extra_xml_names, ["..."]}` in the `esaml` application environment. Parsing stops once the atom table is half full (`atom_ceiling`).
++   CVE-2026-86696: status codes outside SAML 2.0 decode to `unknown`; unknown attribute names stay strings.
++   The duplicate fun of `esaml_sp:validate_assertion/3` now receives the digest of the signed assertion element, not of the whole response (a replay could change the unsigned response and get a new digest).
++   **Behaviour change:** `esaml_binding:decode_response/2` raises `error:{saml_payload_refused, Reason}` for refused payloads.
+
 ### v4.6.0
 +   remove uri double encoding thanks to @DiaanEngelbrecht
 

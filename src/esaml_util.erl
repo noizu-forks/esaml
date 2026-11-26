@@ -23,6 +23,10 @@
 -export([load_metadata/2, load_metadata/1]).
 -export([convert_fingerprints/1]).
 -export([unique_id/0]).
+-export([scan_untrusted_xml/1, bounded_inflate/1, refuse_payload/1, xml_scan_options/0]).
+
+%% Real SAML messages are a few KB to about 100 KB.
+-define(MAX_XML_BYTES, 524288).
 
 %% @doc Converts various ascii hex/base64 fingerprint formats to binary
 -spec convert_fingerprints([string() | binary()]) -> [binary()].
@@ -234,7 +238,7 @@ load_metadata(Url, FPs) ->
         [{Url, Meta}] -> Meta;
         _ ->
             {ok, {{_Ver, 200, _}, _Headers, Body}} = httpc:request(get, {Url, []}, [{autoredirect, true}, {timeout, 3000}], []),
-            {Xml, _} = xmerl_scan:string(Body, [{namespace_conformant, true}]),
+            {Xml, _} = xmerl_scan:string(Body, xml_scan_options()),
             case xmerl_dsig:verify(Xml, Fingerprints) of
                 ok -> ok;
                 Err -> error(Err)
@@ -252,7 +256,7 @@ load_metadata(Url) ->
         _ ->
             Timeout = application:get_env(esaml, load_metadata_timeout, 15000),
             {ok, {{_Ver, 200, _}, _Headers, Body}} = httpc:request(get, {Url, []}, [{autoredirect, true}, {timeout, Timeout}], []),
-            {Xml, _} = xmerl_scan:string(Body, [{namespace_conformant, true}]),
+            {Xml, _} = xmerl_scan:string(Body, xml_scan_options()),
             {ok, Meta = #esaml_idp_metadata{}} = esaml:decode_idp_metadata(Xml),
             ets:insert(esaml_idp_meta_cache, {Url, Meta}),
             Meta
@@ -310,6 +314,253 @@ unique_id() ->
     "id"
       ++ integer_to_list(erlang:system_time())
       ++ integer_to_list(erlang:unique_integer([positive])).
+
+%% @doc Parser options for every XML document that did not come from this node:
+%% no entity declarations and no reads of external files or URLs.
+-spec xml_scan_options() -> list().
+xml_scan_options() ->
+    [{namespace_conformant, true},
+     {allow_entities, false},
+     {fetch_fun, fun refuse_fetch/2}].
+
+refuse_fetch(_Spec, _State) ->
+    refuse_payload(external_fetch_not_allowed).
+
+%% @doc Raise the error used for every refused SAML payload.
+-spec refuse_payload(Reason :: atom()) -> no_return().
+refuse_payload(Reason) ->
+    erlang:error({saml_payload_refused, Reason}).
+
+%% @doc Parse an XML payload that an unauthenticated party can control.
+%%
+%% Raises `error:{saml_payload_refused, Reason}' and never reaches xmerl_scan
+%% when the payload
+%% <ul>
+%% <li>is over 512 KB,</li>
+%% <li>is not plain UTF-8 XML 1.0 (a NUL byte, another declared encoding),</li>
+%% <li>holds a DOCTYPE or a processing instruction,</li>
+%% <li>has anything but comments and white space after the root element,</li>
+%% <li>uses an element name, attribute name, prefix or namespace URI that is
+%% not already an atom. xmerl_scan makes an atom from each of those, and atoms
+%% are never freed. Add names that an identity provider really uses to the
+%% `extra_xml_names' application variable.</li>
+%% </ul>
+%% As a second line of defence it also refuses to parse at all once the node's
+%% atom table is half full (`atom_ceiling' application variable).
+-spec scan_untrusted_xml(binary()) -> #xmlElement{}.
+scan_untrusted_xml(Xml) when is_binary(Xml) ->
+    ok = check_atom_headroom(),
+    ok = check_size(Xml),
+    ok = check_markup(Xml),
+    ok = check_namespace_literals(Xml),
+    ok = check_names(Xml),
+    try xmerl_scan:string(binary_to_list(Xml), xml_scan_options()) of
+        {#xmlElement{} = Doc, _Rest} -> Doc;
+        _ -> refuse_payload(bad_xml)
+    catch
+        exit:_ -> refuse_payload(bad_xml)
+    end.
+
+check_atom_headroom() ->
+    Ceiling = application:get_env(esaml, atom_ceiling,
+                                  erlang:system_info(atom_limit) div 2),
+    case erlang:system_info(atom_count) < Ceiling of
+        true -> ok;
+        false ->
+            error_logger:error_msg("esaml: atom table over ~p entries, refusing to parse SAML~n",
+                                   [Ceiling]),
+            refuse_payload(atom_table_headroom)
+    end.
+
+check_size(Xml) when byte_size(Xml) > ?MAX_XML_BYTES ->
+    refuse_payload(payload_too_large);
+check_size(_) ->
+    ok.
+
+check_markup(Xml) ->
+    %% A NUL byte means UTF-16 or UCS-4, which would hide markup from the checks.
+    binary:match(Xml, <<0>>) =:= nomatch orelse refuse_payload(encoding_not_allowed),
+    re:run(Xml, "<!DOCTYPE|<!ENTITY", [caseless, {capture, none}]) =:= nomatch
+        orelse refuse_payload(doctype_not_allowed),
+    %% The only "<?" allowed is a plain XML 1.0 UTF-8 declaration at the start.
+    Body = strip_declaration(Xml),
+    binary:match(Body, <<"<?">>) =:= nomatch
+        orelse refuse_payload(declaration_or_instruction_not_allowed),
+    ok.
+
+strip_declaration(Xml) ->
+    Declaration =
+        "\\A(?:\\xEF\\xBB\\xBF)?<\\?xml"
+        "\\s+version\\s*=\\s*(?:\"1\\.0\"|'1\\.0')"
+        "(?:\\s+encoding\\s*=\\s*(?:\"(?i:utf-8)\"|'(?i:utf-8)'))?"
+        "(?:\\s+standalone\\s*=\\s*(?:\"(?:yes|no)\"|'(?:yes|no)'))?"
+        "\\s*\\?>",
+    case re:run(Xml, Declaration, [{capture, first, index}]) of
+        {match, [{0, Length}]} ->
+            binary:part(Xml, Length, byte_size(Xml) - Length);
+        nomatch ->
+            Xml
+    end.
+
+%% A namespace URI becomes an atom. Require it to be written as plain printable
+%% ASCII, so that the name check below and xmerl_scan cannot read it differently
+%% (references and white space are normalised by parsers).
+check_namespace_literals(Xml) ->
+    Re = "xmlns(?::[^\\s=<>\"']+)?\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)')",
+    case re:run(Xml, Re, [global, {capture, all_but_first, binary}]) of
+        nomatch -> ok;
+        {match, Matches} ->
+            lists:all(fun(Groups) -> plain_ascii(iolist_to_binary(Groups)) end, Matches)
+                orelse refuse_payload(namespace_not_allowed),
+            ok
+    end.
+
+plain_ascii(Bin) ->
+    lists:all(fun(C) -> C > 16#20 andalso C < 16#7F andalso C =/= $& end,
+              binary_to_list(Bin)).
+
+%% Read the document with the SAX parser, which reports names as strings, and
+%% require every name that xmerl_scan would turn into an atom to be one already.
+check_names(Xml) ->
+    ok = ensure_vocabulary(),
+    Options = [{event_fun, fun name_event/3}, {event_state, ok}],
+    Result = try xmerl_sax_parser:stream(Xml, Options)
+             catch _:_ -> failed
+             end,
+    case Result of
+        {ok, ok, Rest} -> check_trailing(Rest);
+        {saml_name, _Location, Name, _EndTags, _State} ->
+            error_logger:warning_msg("esaml: refused unknown XML name ~tp~n",
+                                     [lists:sublist(Name, 120)]),
+            refuse_payload(unknown_xml_name);
+        _ -> refuse_payload(bad_xml)
+    end.
+
+check_trailing(Rest) when is_binary(Rest) ->
+    Left = re:replace(Rest, "<!--.*?-->", "", [global, dotall, {return, binary}]),
+    %% Text without markup cannot create a name. XML encryption padding can
+    %% leave such bytes behind a decrypted assertion.
+    binary:match(Left, <<"<">>) =:= nomatch orelse refuse_payload(content_after_root),
+    ok.
+
+name_event({startPrefixMapping, Prefix, Uri}, _Location, State) ->
+    require_atoms([qname("xmlns", Prefix), Uri]),
+    State;
+name_event({startElement, Uri, Local, {Prefix, Local}, Attributes}, _Location, State) ->
+    require_atoms([Uri, Local, qname(Prefix, Local)]),
+    lists:foreach(fun({AttrUri, AttrPrefix, AttrLocal, _Value}) ->
+        require_atoms([AttrUri, AttrLocal, qname(AttrPrefix, AttrLocal)])
+    end, Attributes),
+    State;
+name_event(_Event, _Location, State) ->
+    State.
+
+qname("", Local) -> Local;
+qname(Prefix, "") -> Prefix;
+qname(Prefix, Local) -> Prefix ++ ":" ++ Local.
+
+require_atoms(Names) ->
+    lists:foreach(fun(Name) ->
+        Ascii = lists:all(fun(C) -> C < 16#80 end, Name),
+        try
+            true = Ascii,
+            list_to_existing_atom(Name)
+        catch
+            error:_ -> throw({saml_name, Name})
+        end
+    end, Names).
+
+ensure_vocabulary() ->
+    case persistent_term:get({?MODULE, vocabulary}, false) of
+        true -> ok;
+        false ->
+            lists:foreach(fun list_to_atom/1, vocabulary()),
+            persistent_term:put({?MODULE, vocabulary}, true)
+    end,
+    %% Operator-configured names, for identity providers that use their own.
+    lists:foreach(fun list_to_atom/1, application:get_env(esaml, extra_xml_names, [])).
+
+%% The names that SAML 2.0, XML-DSig and XML-Enc messages use. Every prefix is
+%% combined with every local name, because identity providers choose their own
+%% prefixes.
+vocabulary() ->
+    Prefixes = ["saml", "saml2", "samlp", "saml2p", "ds", "dsig", "dsig11", "xenc", "xenc11",
+                "enc", "xs", "xsd", "xsi", "ec", "md", "x500", "xml", "xmlns"]
+               ++ ["ns" ++ integer_to_list(N) || N <- lists:seq(0, 9)],
+    Namespaces = ["urn:oasis:names:tc:SAML:2.0:protocol",
+                  "urn:oasis:names:tc:SAML:2.0:assertion",
+                  "urn:oasis:names:tc:SAML:2.0:metadata",
+                  "urn:oasis:names:tc:SAML:2.0:profiles:attribute:X500",
+                  "http://www.w3.org/2000/09/xmldsig#",
+                  "http://www.w3.org/2001/04/xmldsig-more#",
+                  "http://www.w3.org/2009/xmldsig11#",
+                  "http://www.w3.org/2001/04/xmlenc#",
+                  "http://www.w3.org/2009/xmlenc11#",
+                  "http://www.w3.org/2001/10/xml-exc-c14n#",
+                  "http://www.w3.org/2001/XMLSchema",
+                  "http://www.w3.org/2001/XMLSchema-instance",
+                  "http://www.w3.org/XML/1998/namespace",
+                  "http://www.w3.org/2000/xmlns/"],
+    Locals = string:lexemes(
+        "AuthnRequest Response LogoutRequest LogoutResponse Status StatusCode StatusMessage "
+        "StatusDetail Extensions NameIDPolicy RequestedAuthnContext Scoping IDPList IDPEntry "
+        "GetComplete RequesterID SessionIndex Artifact ArtifactResolve ArtifactResponse "
+        "Assertion EncryptedAssertion Issuer Subject NameID BaseID EncryptedID "
+        "SubjectConfirmation SubjectConfirmationData Conditions Condition AudienceRestriction "
+        "Audience OneTimeUse ProxyRestriction Advice AssertionIDRef AssertionURIRef Statement "
+        "AuthnStatement SubjectLocality AuthnContext AuthnContextClassRef AuthnContextDeclRef "
+        "AuthnContextDecl AuthenticatingAuthority AttributeStatement Attribute AttributeValue "
+        "EncryptedAttribute AuthzDecisionStatement Action Evidence "
+        "Signature SignedInfo CanonicalizationMethod SignatureMethod Reference Transforms "
+        "Transform DigestMethod DigestValue SignatureValue KeyInfo KeyName KeyValue RSAKeyValue "
+        "Modulus Exponent DSAKeyValue ECKeyValue X509Data X509Certificate X509IssuerSerial "
+        "X509IssuerName X509SerialNumber X509SubjectName X509SKI X509CRL X509Digest "
+        "RetrievalMethod Object Manifest SignatureProperties SignatureProperty "
+        "HMACOutputLength XPath PGPData SPKIData MgmtData InclusiveNamespaces "
+        "EncryptedData EncryptedKey EncryptionMethod CipherData CipherValue CipherReference "
+        "KeySize OAEPparams MGF ReferenceList DataReference KeyReference CarriedKeyName "
+        "AgreementMethod EncryptionProperties EncryptionProperty "
+        "ID Id Version IssueInstant Destination Consent InResponseTo Format NameQualifier "
+        "SPNameQualifier SPProvidedID Method NotBefore NotOnOrAfter Recipient Address "
+        "AuthnInstant SessionNotOnOrAfter Name NameFormat FriendlyName Value Algorithm URI "
+        "Type MimeType Encoding PrefixList AllowCreate ForceAuthn IsPassive ProtocolBinding "
+        "AssertionConsumerServiceURL AssertionConsumerServiceIndex "
+        "AttributeConsumingServiceIndex ProviderName Reason Comparison ProxyCount Loc DNSName "
+        "Resource Decision Namespace Count ProviderID type nil lang space base schemaLocation",
+        " "),
+    ["", "xmlns" | Namespaces] ++ Locals ++ Prefixes
+        ++ [P ++ ":" ++ N || P <- Prefixes, N <- Locals ++ Prefixes].
+
+%% @doc Inflate raw DEFLATE data without ever holding more than 512 KB of output.
+%%
+%% Raises `error:data_error' on data that is not a complete raw DEFLATE stream,
+%% as zlib:unzip/1 does, and refuses the payload when the input or the output is
+%% over the limit.
+-spec bounded_inflate(binary()) -> binary().
+bounded_inflate(Data) when byte_size(Data) > ?MAX_XML_BYTES ->
+    refuse_payload(payload_too_large);
+bounded_inflate(Data) ->
+    Z = zlib:open(),
+    try
+        ok = zlib:inflateInit(Z, -15),
+        inflate_loop(Z, zlib:safeInflate(Z, Data), [], 0)
+    after
+        zlib:close(Z)
+    end.
+
+inflate_loop(Z, {Status, Output}, Acc, Size0) when Status =:= continue; Status =:= finished ->
+    Size = Size0 + iolist_size(Output),
+    Size =< ?MAX_XML_BYTES orelse refuse_payload(payload_too_large),
+    case Status of
+        continue ->
+            inflate_loop(Z, zlib:safeInflate(Z, []), [Acc, Output], Size);
+        finished ->
+            %% Raises data_error when the stream was cut short.
+            ok = zlib:inflateEnd(Z),
+            iolist_to_binary([Acc, Output])
+    end;
+inflate_loop(_Z, {need_dictionary, _, _}, _Acc, _Size) ->
+    erlang:error(data_error).
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").

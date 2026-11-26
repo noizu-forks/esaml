@@ -107,8 +107,30 @@ status_code_map("urn:oasis:names:tc:SAML:2.0:status:AuthnFailed") -> authn_faile
 status_code_map("urn:oasis:names:tc:SAML:2.0:status:InvalidAttrNameOrValue") -> bad_attr;
 status_code_map("urn:oasis:names:tc:SAML:2.0:status:RequestDenied") -> denied;
 status_code_map("urn:oasis:names:tc:SAML:2.0:status:UnsupportedBinding") -> bad_binding;
-status_code_map(Urn = "urn:" ++ _) -> list_to_atom(lists:last(string:tokens(Urn, ":")));
+%% A status code can come from an unsigned message, so it never makes an atom.
+%% The remaining SAML 2.0 codes keep the atoms they had before; all others,
+%% including vendor codes, are `unknown'.
+status_code_map("urn:oasis:names:tc:SAML:2.0:status:" ++ Name) -> standard_status_code(Name);
 status_code_map(S) when is_list(S) -> unknown.
+
+standard_status_code("Requester") -> 'Requester';
+standard_status_code("Responder") -> 'Responder';
+standard_status_code("InvalidNameIDPolicy") -> 'InvalidNameIDPolicy';
+standard_status_code("NoAuthnContext") -> 'NoAuthnContext';
+standard_status_code("NoAvailableIDP") -> 'NoAvailableIDP';
+standard_status_code("NoPassive") -> 'NoPassive';
+standard_status_code("NoSupportedIDP") -> 'NoSupportedIDP';
+standard_status_code("PartialLogout") -> 'PartialLogout';
+standard_status_code("ProxyCountExceeded") -> 'ProxyCountExceeded';
+standard_status_code("RequestUnsupported") -> 'RequestUnsupported';
+standard_status_code("RequestVersionDeprecated") -> 'RequestVersionDeprecated';
+standard_status_code("RequestVersionTooHigh") -> 'RequestVersionTooHigh';
+standard_status_code("RequestVersionTooLow") -> 'RequestVersionTooLow';
+standard_status_code("ResourceNotRecognized") -> 'ResourceNotRecognized';
+standard_status_code("TooManyResponses") -> 'TooManyResponses';
+standard_status_code("UnknownAttrProfile") -> 'UnknownAttrProfile';
+standard_status_code("UnknownPrincipal") -> 'UnknownPrincipal';
+standard_status_code(_) -> unknown.
 
 -spec rev_status_code_map(status_code()) -> string().
 rev_status_code_map(success) -> "urn:oasis:names:tc:SAML:2.0:status:Success";
@@ -128,7 +150,8 @@ logout_reason_map(S) when is_list(S) -> unknown.
 rev_logout_reason_map(user) -> "urn:oasis:names:tc:SAML:2.0:logout:user";
 rev_logout_reason_map(admin) -> "urn:oasis:names:tc:SAML:2.0:logout:admin".
 
--spec common_attrib_map(string()) -> atom().
+%% An attribute name that is not an atom yet stays a string.
+-spec common_attrib_map(string()) -> atom() | string().
 common_attrib_map("urn:oid:2.16.840.1.113730.3.1.3") -> employeeNumber;
 common_attrib_map("urn:oid:1.3.6.1.4.1.5923.1.1.1.6") -> eduPersonPrincipalName;
 common_attrib_map("urn:oid:0.9.2342.19200300.100.1.3") -> mail;
@@ -142,8 +165,13 @@ common_attrib_map("urn:oid:1.3.6.1.4.1.5923.1.1.1.9") -> eduPersonScopedAffiliat
 common_attrib_map("urn:oid:2.16.840.1.113730.3.1.4") -> employeeType;
 common_attrib_map("urn:oid:0.9.2342.19200300.100.1.1") -> uid;
 common_attrib_map("urn:oid:2.5.4.4") -> surName;
-common_attrib_map(Uri = "http://" ++ _) -> list_to_atom(lists:last(string:tokens(Uri, "/")));
-common_attrib_map(Other) when is_list(Other) -> list_to_atom(Other).
+common_attrib_map(Uri = "http://" ++ _) -> existing_atom_or_string(lists:last(string:tokens(Uri, "/")));
+common_attrib_map(Other) when is_list(Other) -> existing_atom_or_string(Other).
+
+existing_atom_or_string(Name) ->
+    try list_to_existing_atom(Name)
+    catch error:badarg -> Name
+    end.
 
 -include("xmerl_xpath_macros.hrl").
 
@@ -284,7 +312,7 @@ decode_assertion_conditions(Xml) ->
         end
     ], []).
 
--spec decode_assertion_attributes(#xmlElement{}) -> {ok, [{atom(), string()}]} | {error, term()}.
+-spec decode_assertion_attributes(#xmlElement{}) -> {ok, [{atom() | string(), string()}]} | {error, term()}.
 decode_assertion_attributes(Xml) ->
     Ns = [{"saml", 'urn:oasis:names:tc:SAML:2.0:assertion'}],
     Attrs = xmerl_xpath:string("/saml:AttributeStatement/saml:Attribute", Xml, [{namespace, Ns}]),
